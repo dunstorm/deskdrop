@@ -20,6 +20,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let eng = Engine::new("devpeer".into(), cache, u64::MAX, remote_tx);
     let e = eng.clone();
     thread::spawn(move || e.pump_local(local_rx));
+    let e = eng.clone();
+    thread::spawn(move || e.keepalive());
     let a = addr.clone();
     thread::spawn(move || eng.connect(vec![a], psk));
     thread::spawn(move || {

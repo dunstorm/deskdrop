@@ -1,20 +1,22 @@
 //! macOS clipboard via NSPasteboard. Polls changeCount (there is no change notification)
 //! and serves remote files lazily: Finder's paste blocks until the download is done.
+//! Transfer progress is shown in a floating panel (see `mac_hud`).
 
-use crate::engine::{LocalClip, RemoteClip, Transfer};
+use crate::engine::{Engine, LocalClip, RemoteClip, Transfer};
 use crate::log;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
+use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{
-    NSPasteboard, NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardType, NSPasteboardTypeFileURL,
-    NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF, NSPasteboardWriting,
+    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSPasteboard, NSPasteboardItem,
+    NSPasteboardItemDataProvider, NSPasteboardType, NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG,
+    NSPasteboardTypeString, NSPasteboardTypeTIFF, NSPasteboardWriting,
 };
-use objc2_foundation::{NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSRunLoop, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSString, NSURL};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PASTE_WAIT: Duration = Duration::from_secs(600);
 
@@ -35,7 +37,17 @@ define_class!(
         #[unsafe(method(pasteboard:item:provideDataForType:))]
         fn provide(&self, _pb: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
             let iv = self.ivars();
-            if let Err(e) = iv.transfer.wait(PASTE_WAIT) {
+            // This runs on the main thread, so keep the menu bar progress fresh while we wait.
+            let deadline = Instant::now() + PASTE_WAIT;
+            let r = loop {
+                match iv.transfer.wait_step(Duration::from_millis(150)) {
+                    Some(r) => break r,
+                    None if Instant::now() > deadline => break Err("timed out".into()),
+                    None => super::mac_hud::update(),
+                }
+            };
+            super::mac_hud::update();
+            if let Err(e) = r {
                 log!("paste of remote files failed: {e}");
                 return;
             }
@@ -121,23 +133,44 @@ fn write_remote(pb: &NSPasteboard, clip: &RemoteClip, keep: &mut Vec<Retained<Fi
     }
 }
 
-pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>) -> ! {
+pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>, engine: Arc<Engine>) -> ! {
+    let mtm = MainThreadMarker::new().expect("platform::run must be called on the main thread");
+    // A UI-less "accessory" app: no Dock icon, but allowed to own a menu bar item.
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+    super::mac_hud::init(engine, mtm);
+    // Test hook: leave the real clipboard alone (agent only moves data and shows progress).
+    #[cfg(feature = "devpeer")]
+    let no_clipboard = std::env::var_os("DESKDROP_NO_CLIPBOARD").is_some();
+    #[cfg(not(feature = "devpeer"))]
+    let no_clipboard = false;
     let pb = NSPasteboard::generalPasteboard();
-    let rl = NSRunLoop::currentRunLoop();
     let mut last = pb.changeCount();
     let mut keep = Vec::new();
     loop {
-        // Pump the run loop so lazy-data requests from other apps get served.
+        // Runs the run loop too, so lazy-data requests from other apps get served.
         let until = NSDate::dateWithTimeIntervalSinceNow(0.2);
-        if !unsafe { rl.runMode_beforeDate(NSDefaultRunLoopMode, &until) } {
-            std::thread::sleep(Duration::from_millis(200));
+        let ev = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&until),
+                NSDefaultRunLoopMode,
+                true,
+            )
+        };
+        if let Some(ev) = ev {
+            app.sendEvent(&ev);
         }
+        super::mac_hud::update();
         while let Ok(clip) = remote_rx.try_recv() {
-            write_remote(&pb, &clip, &mut keep);
-            last = pb.changeCount();
+            if !no_clipboard {
+                write_remote(&pb, &clip, &mut keep);
+                last = pb.changeCount();
+            }
         }
         let cc = pb.changeCount();
-        if cc != last {
+        if cc != last && !no_clipboard {
             last = cc;
             let clip = read_local(&pb);
             if clip.text.is_some() || clip.png.is_some() || !clip.files.is_empty() {

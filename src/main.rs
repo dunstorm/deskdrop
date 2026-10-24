@@ -150,6 +150,7 @@ fn run() -> Result<(), String> {
     let (remote_tx, remote_rx) = channel();
     let max = (cfg.max_transfer_gb * 1e9) as u64;
     let eng = engine::Engine::new(hostname(), cache_dir(), max, remote_tx);
+    let eng_ui = eng.clone();
     {
         let e = eng.clone();
         thread::spawn(move || e.pump_local(local_rx));
@@ -167,7 +168,7 @@ fn run() -> Result<(), String> {
         }
         _ => return Err("config needs either `listen` or `connect`".into()),
     }
-    platform::run(local_tx, remote_rx)
+    platform::run(local_tx, remote_rx, eng_ui)
 }
 
 /// Split off a trailing `--install` flag.

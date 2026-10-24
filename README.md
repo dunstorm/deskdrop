@@ -64,6 +64,9 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
   waits for it and then copies the files out of the cache.
 - Folders (including empty ones), Unicode names, and modification times are kept.
   `.DS_Store`, `Thumbs.db`, and `desktop.ini` are skipped.
+- Copies that take more than a moment show a **progress panel** with speed and time left, on
+  both machines. On the Mac it floats in the top-right corner; on Windows it sits above the
+  taskbar clock (click it to dismiss). It shows "Received" when the copy is done, then hides itself.
 - Text is converted between `\n` and `\r\n`. Images travel as PNG, with `CF_DIB` added on
   Windows for older apps. Rich text travels as HTML.
 
@@ -101,7 +104,7 @@ Logs are written to `deskdrop.log` in the same folder.
 - **The client can't reach the server.** With the macOS firewall on, allow incoming connections
   for `deskdrop`. With Windows as the server, allow TCP 24802 in Windows Defender Firewall.
 - **Big copies paste slowly.** The paste waits for the download to finish. Transfers run at LAN
-  speed; there's no progress indicator yet.
+  speed; watch the progress panel to see how long is left.
 - **"Windows protected your PC" or a Gatekeeper warning.** Release binaries aren't code-signed
   yet. Downloading with `iwr` or `curl` as shown above avoids the warning. Otherwise choose
   *More info → Run anyway*, or run `xattr -d com.apple.quarantine deskdrop`.

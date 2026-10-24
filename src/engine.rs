@@ -13,11 +13,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const CHUNK: usize = 65000;
 const KEEP_OFFERS: usize = 4;
 const SKIP_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+/// Transfers that finish faster than this never show progress UI.
+const SHOW_AFTER: Duration = Duration::from_millis(400);
+const SHOW_DONE_FOR: Duration = Duration::from_secs(2);
+const SHOW_FAILED_FOR: Duration = Duration::from_secs(6);
 
 /// Clipboard contents read from the local OS.
 #[derive(Default, Debug)]
@@ -36,52 +40,124 @@ pub struct RemoteClip {
     pub files: Option<Arc<Transfer>>,
 }
 
+#[derive(Clone)]
 enum TState {
     Pending,
     Done,
     Failed(String),
+    Cancelled,
 }
 
-/// An inbound file set being downloaded into the cache.
+/// A file set moving in either direction. Inbound ones are downloaded into the cache.
 pub struct Transfer {
     pub id: u64,
-    /// Absolute paths (in the cache) of the top-level entries, in copy order.
+    /// Absolute paths (in the cache) of the top-level entries, in copy order. Empty for uploads.
     pub top: Vec<PathBuf>,
     pub total: u64,
-    received: AtomicU64,
-    state: Mutex<TState>,
+    upload: bool,
+    /// "“name”" for a single item, "N items" otherwise.
+    label: String,
+    started: Instant,
+    bytes: AtomicU64,
+    state: Mutex<(TState, Option<Instant>)>,
     cv: Condvar,
 }
 
 impl Transfer {
-    /// Block until the download finishes, fails, or `timeout` elapses.
-    pub fn wait(&self, timeout: Duration) -> Result<(), String> {
-        let g = self.state.lock().unwrap();
-        let (g, _) = self
-            .cv
-            .wait_timeout_while(g, timeout, |s| matches!(s, TState::Pending))
-            .unwrap();
-        match &*g {
-            TState::Done => Ok(()),
-            TState::Failed(e) => Err(e.clone()),
-            TState::Pending => Err(format!(
-                "timed out ({} of {} MB received)",
-                self.received.load(Ordering::Relaxed) >> 20,
-                self.total >> 20
-            )),
+    fn new(id: u64, upload: bool, top_names: &[&str], top: Vec<PathBuf>, total: u64) -> Self {
+        let label = match top_names {
+            [one] => format!("“{one}”"),
+            many => format!("{} items", many.len()),
+        };
+        Transfer {
+            id,
+            top,
+            total,
+            upload,
+            label,
+            started: Instant::now(),
+            bytes: AtomicU64::new(0),
+            state: Mutex::new((TState::Pending, None)),
+            cv: Condvar::new(),
         }
     }
 
+    /// Wait up to `timeout`; `None` if the transfer is still running.
+    pub fn wait_step(&self, timeout: Duration) -> Option<Result<(), String>> {
+        let g = self.state.lock().unwrap();
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |s| matches!(s.0, TState::Pending))
+            .unwrap();
+        match &g.0 {
+            TState::Pending => None,
+            TState::Done => Some(Ok(())),
+            TState::Failed(e) => Some(Err(e.clone())),
+            TState::Cancelled => Some(Err("cancelled".into())),
+        }
+    }
+
+    /// Block until the transfer finishes, fails, or `timeout` elapses.
+    #[allow(dead_code)]
+    pub fn wait(&self, timeout: Duration) -> Result<(), String> {
+        self.wait_step(timeout).unwrap_or_else(|| {
+            Err(format!(
+                "timed out ({} of {} MB received)",
+                self.bytes.load(Ordering::Relaxed) >> 20,
+                self.total >> 20
+            ))
+        })
+    }
+
     pub fn is_done(&self) -> bool {
-        matches!(*self.state.lock().unwrap(), TState::Done)
+        matches!(self.state.lock().unwrap().0, TState::Done)
     }
 
     fn finish(&self, s: TState) {
         let mut g = self.state.lock().unwrap();
-        if matches!(*g, TState::Pending) {
-            *g = s;
+        if matches!(g.0, TState::Pending) {
+            *g = (s, Some(Instant::now()));
         }
         self.cv.notify_all();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ViewState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// What the platform's progress UI should show right now.
+#[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct ProgressView {
+    pub id: u64,
+    pub state: ViewState,
+    /// e.g. "Receiving 3 items from MacBook"
+    pub title: String,
+    /// e.g. "120 MB of 300 MB · 85 MB/s · 2 s left"
+    pub detail: String,
+    pub fraction: f64,
+}
+
+fn human_bytes(b: u64) -> String {
+    let b = b as f64;
+    match b {
+        b if b >= 1e9 => format!("{:.1} GB", b / 1e9),
+        b if b >= 1e6 => format!("{:.0} MB", b / 1e6),
+        b if b >= 1e3 => format!("{:.0} KB", b / 1e3),
+        b => format!("{b} B"),
+    }
+}
+
+fn human_secs(s: f64) -> String {
+    let s = (s.round() as u64).max(1);
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min {} s", s / 60, s % 60),
+        _ => format!("{} h {} min", s / 3600, (s % 3600) / 60),
     }
 }
 
@@ -99,6 +175,9 @@ struct Inbound {
 
 pub struct Engine {
     name: String,
+    peer_name: Mutex<String>,
+    /// Most recent file transfer in either direction, for progress UI.
+    activity: Mutex<Option<Arc<Transfer>>>,
     conn: Mutex<Option<Arc<Conn>>>,
     offers: Mutex<VecDeque<Offer>>,
     sending: Mutex<HashMap<u64, Arc<AtomicBool>>>,
@@ -117,6 +196,8 @@ impl Engine {
         getrandom::getrandom(&mut seed).unwrap();
         Arc::new(Engine {
             name,
+            peer_name: Mutex::new("the other computer".into()),
+            activity: Mutex::new(None),
             conn: Mutex::new(None),
             offers: Mutex::new(VecDeque::new()),
             sending: Mutex::new(HashMap::new()),
@@ -140,6 +221,64 @@ impl Engine {
 
     fn connected(&self) -> bool {
         self.conn.lock().unwrap().is_some()
+    }
+
+    /// Progress of the latest file transfer, or `None` when nothing should be shown.
+    pub fn progress(&self) -> Option<ProgressView> {
+        let t = self.activity.lock().unwrap().clone()?;
+        let (state, ended) = t.state.lock().unwrap().clone();
+        let now = Instant::now();
+        let end = ended.unwrap_or(now);
+        let elapsed = end - t.started;
+        let state = match state {
+            TState::Pending if elapsed < SHOW_AFTER => return None,
+            TState::Pending => ViewState::Running,
+            TState::Done if elapsed < SHOW_AFTER || now - end > SHOW_DONE_FOR => return None,
+            TState::Done => ViewState::Done,
+            TState::Failed(_) if now - end > SHOW_FAILED_FOR => return None,
+            TState::Failed(_) => ViewState::Failed,
+            TState::Cancelled => return None,
+        };
+        let failure = match &t.state.lock().unwrap().0 {
+            TState::Failed(e) => e.clone(),
+            _ => String::new(),
+        };
+        let bytes = t.bytes.load(Ordering::Relaxed).min(t.total);
+        let fraction = if t.total == 0 {
+            1.0
+        } else {
+            bytes as f64 / t.total as f64
+        };
+        let peer = self.peer_name.lock().unwrap().clone();
+        let (verb, prep) = if t.upload {
+            ("Sending", "to")
+        } else {
+            ("Receiving", "from")
+        };
+        let secs = elapsed.as_secs_f64().max(0.001);
+        let (title, detail) = match state {
+            ViewState::Running => {
+                let rate = bytes as f64 / secs;
+                let mut detail = format!("{} of {}", human_bytes(bytes), human_bytes(t.total));
+                if secs > 1.0 && rate > 0.0 {
+                    let left = (t.total - bytes) as f64 / rate;
+                    detail += &format!(" · {}/s · {} left", human_bytes(rate as u64), human_secs(left));
+                }
+                (format!("{verb} {} {prep} {peer}", t.label), detail)
+            }
+            ViewState::Done => (
+                format!("{} {}", if t.upload { "Sent" } else { "Received" }, t.label),
+                format!("{} in {}", human_bytes(t.total), human_secs(secs)),
+            ),
+            ViewState::Failed => (format!("Couldn’t copy {}", t.label), failure),
+        };
+        Some(ProgressView {
+            id: t.id,
+            state,
+            title,
+            detail,
+            fraction,
+        })
     }
 
     // ---------- local -> remote ----------
@@ -211,6 +350,14 @@ impl Engine {
                 }
             }
         };
+        let top: Vec<&str> = files
+            .iter()
+            .filter(|(_, e)| !e.path.contains('/'))
+            .map(|(_, e)| e.path.as_str())
+            .collect();
+        let total = files.iter().map(|(_, e)| e.size).sum();
+        let t = Arc::new(Transfer::new(id, true, &top, vec![], total));
+        *self.activity.lock().unwrap() = Some(t.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut s = self.sending.lock().unwrap();
@@ -221,12 +368,20 @@ impl Engine {
         }
         let me = self.clone();
         thread::spawn(move || {
-            let r = me.upload(id, &files, &cancel);
+            let r = me.upload(&t, &files, &cancel);
             me.sending.lock().unwrap().remove(&id);
             match r {
-                Ok(true) => me.send(&Msg::Ctl(Ctl::Done { id }, vec![])),
-                Ok(false) => log!("upload {id} cancelled"),
+                Ok(true) => {
+                    t.finish(TState::Done);
+                    me.send(&Msg::Ctl(Ctl::Done { id }, vec![]));
+                }
+                Ok(false) if !me.connected() => t.finish(TState::Failed("the other computer disconnected".into())),
+                Ok(false) => {
+                    t.finish(TState::Cancelled);
+                    log!("upload {id} cancelled");
+                }
                 Err(e) => {
+                    t.finish(TState::Failed(e.clone()));
                     log!("upload {id} failed: {e}");
                     me.send(&Msg::Ctl(Ctl::Fail { id, msg: e }, vec![]));
                 }
@@ -234,7 +389,10 @@ impl Engine {
         });
     }
 
-    fn upload(&self, id: u64, files: &[(PathBuf, Entry)], cancel: &AtomicBool) -> Result<bool, String> {
+    fn upload(&self, t: &Transfer, files: &[(PathBuf, Entry)], cancel: &AtomicBool) -> Result<bool, String> {
+        let id = t.id;
+        #[cfg(feature = "devpeer")]
+        let throttle = std::env::var("DESKDROP_THROTTLE_MS").ok().and_then(|v| v.parse().ok());
         let conn = self.conn.lock().unwrap().clone().ok_or("not connected")?;
         let mut buf = vec![0u8; CHUNK];
         for (idx, (abs, e)) in files.iter().enumerate() {
@@ -253,12 +411,17 @@ impl Engine {
                     return Err(format!("{} shrank while copying", abs.display()));
                 }
                 left -= n as u64;
+                #[cfg(feature = "devpeer")]
+                if let Some(ms) = throttle {
+                    thread::sleep(Duration::from_millis(ms));
+                }
                 conn.send(&Msg::Chunk {
                     id,
                     idx: idx as u32,
                     data: buf[..n].to_vec(),
                 })
                 .map_err(|e| e.to_string())?;
+                t.bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
         Ok(true)
@@ -269,7 +432,8 @@ impl Engine {
     fn cancel_inbound(&self, why: &str) {
         if let Some(ib) = self.inbound.lock().unwrap().take() {
             if !ib.t.is_done() {
-                ib.t.finish(TState::Failed(why.into()));
+                log!("dropping remote copy: {why}");
+                ib.t.finish(TState::Cancelled);
                 self.send(&Msg::Ctl(Ctl::Cancel { id: ib.t.id }, vec![]));
             }
         }
@@ -290,6 +454,7 @@ impl Engine {
                 match self.prepare(id, &entries, total) {
                     Ok(ib) => {
                         files = Some(ib.t.clone());
+                        *self.activity.lock().unwrap() = Some(ib.t.clone());
                         *self.inbound.lock().unwrap() = Some(ib);
                         self.send(&Msg::Ctl(Ctl::Fetch { id }, vec![]));
                         log!("receiving {} entries, {:.1} MB", entries.len(), total as f64 / 1e6);
@@ -329,14 +494,12 @@ impl Engine {
             });
         }
         let done = total == 0;
-        let t = Arc::new(Transfer {
-            id,
-            top,
-            total,
-            received: AtomicU64::new(0),
-            state: Mutex::new(TState::Pending),
-            cv: Condvar::new(),
-        });
+        let names: Vec<&str> = entries
+            .iter()
+            .filter(|e| !e.path.contains('/'))
+            .map(|e| e.path.as_str())
+            .collect();
+        let t = Arc::new(Transfer::new(id, false, &names, top, total));
         let ib = Inbound {
             t,
             root,
@@ -395,7 +558,7 @@ impl Engine {
             self.send(&Msg::Ctl(Ctl::Cancel { id }, vec![]));
             return;
         }
-        ib.t.received.fetch_add(data.len() as u64, Ordering::Relaxed);
+        ib.t.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
     }
 
     fn on_done(&self, id: u64, err: Option<String>) {
@@ -421,7 +584,10 @@ impl Engine {
         match m {
             Msg::Chunk { id, idx, data } => self.on_chunk(id, idx, &data),
             Msg::Ctl(c, blob) => match c {
-                Ctl::Hello { name, version } => log!("peer is {name} (deskdrop {version})"),
+                Ctl::Hello { name, version } => {
+                    log!("peer is {name} (deskdrop {version})");
+                    *self.peer_name.lock().unwrap() = name;
+                }
                 Ctl::Clip {
                     id,
                     text,
@@ -619,5 +785,41 @@ fn finalize(ib: &Inbound) {
     for e in ib.entries.iter().rev() {
         let t = filetime::FileTime::from_unix_time(e.mtime, 0);
         let _ = filetime::set_file_mtime(ib.root.join(&e.path), t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_view_lifecycle() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let dir = std::env::temp_dir().join(format!("deskdrop-test-{}", std::process::id()));
+        let eng = Engine::new("me".into(), dir.clone(), u64::MAX, tx);
+        *eng.peer_name.lock().unwrap() = "PC".into();
+        let mut t = Transfer::new(7, false, &["a", "b"], vec![], 300_000_000);
+        t.started = Instant::now() - Duration::from_secs(2);
+        let t = Arc::new(t);
+        t.bytes.store(100_000_000, Ordering::Relaxed);
+        *eng.activity.lock().unwrap() = Some(t.clone());
+        let v = eng.progress().unwrap();
+        assert_eq!(v.state, ViewState::Running);
+        assert_eq!(v.title, "Receiving 2 items from PC");
+        assert!((v.fraction - 1.0 / 3.0).abs() < 1e-9);
+        assert!(
+            v.detail.starts_with("100 MB of 300 MB · 50 MB/s · 4 s left"),
+            "{}",
+            v.detail
+        );
+        t.finish(TState::Done);
+        assert_eq!(eng.progress().unwrap().state, ViewState::Done);
+
+        // Fast transfers never show anything.
+        let quick = Arc::new(Transfer::new(8, true, &["x.bin"], vec![], 10));
+        quick.finish(TState::Done);
+        *eng.activity.lock().unwrap() = Some(quick);
+        assert!(eng.progress().is_none());
+        let _ = fs::remove_dir_all(dir);
     }
 }

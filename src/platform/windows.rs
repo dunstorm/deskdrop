@@ -2,7 +2,7 @@
 //! delay-rendered CF_HDROP: Explorer's paste triggers WM_RENDERFORMAT, which waits for
 //! the download to finish and then hands over the cached paths.
 
-use crate::engine::{LocalClip, RemoteClip, Transfer};
+use crate::engine::{Engine, LocalClip, RemoteClip, Transfer};
 use crate::log;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -34,6 +34,8 @@ thread_local! {
     static FMT: RefCell<Option<Formats>> = const { RefCell::new(None) };
     static IO: RefCell<Option<(Sender<LocalClip>, Receiver<RemoteClip>)>> = const { RefCell::new(None) };
     static PENDING: RefCell<Option<Arc<Transfer>>> = const { RefCell::new(None) };
+    /// Test hook (devpeer builds): leave the real clipboard alone.
+    static NO_CLIPBOARD: Cell<bool> = const { Cell::new(false) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -202,7 +204,7 @@ unsafe fn render_files() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLIPBOARDUPDATE => {
-            if GetClipboardOwner() != hwnd {
+            if GetClipboardOwner() != hwnd && !NO_CLIPBOARD.get() {
                 if let Some(clip) = read_local() {
                     IO.with(|io| {
                         let _ = io.borrow().as_ref().unwrap().0.send(clip);
@@ -215,6 +217,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             loop {
                 let next = IO.with(|io| io.borrow().as_ref().unwrap().1.try_recv().ok());
                 match next {
+                    Some(_) if NO_CLIPBOARD.get() => {}
                     Some(c) => write_remote(c),
                     None => break,
                 }
@@ -247,8 +250,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>) -> ! {
+pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>, engine: Arc<Engine>) -> ! {
     unsafe {
+        SetProcessDPIAware();
+        #[cfg(feature = "devpeer")]
+        NO_CLIPBOARD.set(std::env::var_os("DESKDROP_NO_CLIPBOARD").is_some());
+        super::win_progress::spawn(engine);
         FMT.with(|f| {
             *f.borrow_mut() = Some(Formats {
                 html: reg("HTML Format"),
