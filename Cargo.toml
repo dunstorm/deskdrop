@@ -2,7 +2,14 @@
 name = "deskdrop"
 version = "0.1.0"
 edition = "2021"
-description = "Clipboard + file copy/paste between macOS and Windows, a companion to Deskflow"
+rust-version = "1.88"
+description = "Copy/paste text, images and files between macOS and Windows; a companion to Deskflow"
+license = "MIT"
+repository = "https://github.com/dunstorm/deskdrop"
+readme = "README.md"
+keywords = ["clipboard", "deskflow", "file-transfer", "macos", "windows"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [".github/", "examples/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -193,7 +193,7 @@ fn init_server(args: &[String]) -> Result<(), String> {
     }
     println!("Wrote {}", config_path().display());
     println!(
-        "\nOn the other computer run:\n\n  deskdrop init-client {} {secret} --install\n",
+        "\nOn the other computer run:\n\n  deskdrop init-client \"{}\" {secret} --install\n",
         addrs.join(",")
     );
     if inst {
@@ -209,6 +209,7 @@ fn init_client(args: &[String]) -> Result<(), String> {
         return Err("usage: deskdrop init-client HOST:PORT[,HOST:PORT...] SECRET".into());
     };
     let connect = addrs
+        .trim_matches(['"', '\''])
         .split(',')
         .map(|a| {
             if a.contains(':') {
