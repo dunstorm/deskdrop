@@ -282,11 +282,20 @@ fn install() -> Result<(), String> {
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("{domain}/{LABEL}")])
         .output();
-    let out = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(plist_path())
-        .output()
-        .map_err(|e| e.to_string())?;
+    // bootout returns before the old instance is fully gone; retry until launchd accepts it.
+    let mut tries = 0;
+    let out = loop {
+        let out = Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(plist_path())
+            .output()
+            .map_err(|e| e.to_string())?;
+        tries += 1;
+        if out.status.success() || tries == 20 {
+            break out;
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    };
     if !out.status.success() {
         return Err(format!("launchctl bootstrap: {}", String::from_utf8_lossy(&out.stderr)));
     }
@@ -327,8 +336,16 @@ fn install() -> Result<(), String> {
         ])
         .output();
     if me != bin {
-        thread::sleep(std::time::Duration::from_millis(500));
-        fs::copy(&me, &bin).map_err(|e| format!("copy binary: {e}"))?;
+        fs::create_dir_all(app_dir()).map_err(|e| e.to_string())?;
+        // The killed instance can hold the file open for a moment.
+        let mut tries = 0;
+        while let Err(e) = fs::copy(&me, &bin) {
+            tries += 1;
+            if tries == 20 {
+                return Err(format!("copy binary: {e}"));
+            }
+            thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
     let val = format!("\"{}\" run", bin.display());
     let out = Command::new("reg")
