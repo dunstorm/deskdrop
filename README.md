@@ -54,7 +54,7 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
 
 ## How it works
 
-- A small agent (about 2 MB, no dependencies) runs on each machine. The server listens on TCP
+- A small agent (a few MB, no runtime dependencies) runs on each machine. The server listens on TCP
   **24802**, and the client dials it, trying each address in turn and reconnecting on its own.
 - When you copy files, the file list goes to the other machine right away, and that machine
   starts downloading the contents into a cache (`~/Library/Caches/deskdrop` or
