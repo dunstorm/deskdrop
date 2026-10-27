@@ -16,10 +16,16 @@ use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::Shell::DragQueryFileW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const PASTE_WAIT: Duration = Duration::from_secs(600);
+/// Processes that read every clipboard change without a paste (clipboard history, cloud
+/// clipboard and suggested actions run in svchost). They must not start a download.
+const BACKGROUND_READERS: &[&str] = &["svchost.exe"];
 
 struct Formats {
     html: u32,
@@ -190,12 +196,41 @@ unsafe fn write_remote(clip: RemoteClip) {
     CloseClipboard();
 }
 
+/// Executable name of the process that has the clipboard open, i.e. the one asking for data.
+unsafe fn requester() -> String {
+    let w = GetOpenClipboardWindow();
+    if w.is_null() {
+        return "an unknown app".into();
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(w, &mut pid);
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if h.is_null() {
+        return format!("pid {pid}");
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+    CloseHandle(h);
+    if ok == 0 {
+        return format!("pid {pid}");
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit('\\').next().unwrap_or(&path).to_string()
+}
+
 /// Called on WM_RENDERFORMAT (clipboard already opened by the requester).
 unsafe fn render_files() {
     let Some(t) = PENDING.with(|p| p.borrow().clone()) else {
         return;
     };
-    t.request();
+    let by = requester();
+    if BACKGROUND_READERS.iter().any(|n| by.eq_ignore_ascii_case(n)) {
+        // Leave the format unrendered; a real paste asks again.
+        log!("not downloading files for {by}: not a paste");
+        return;
+    }
+    t.request(&by);
     match t.wait(PASTE_WAIT) {
         Ok(()) => set_bytes(CF_HDROP as u32, &hdrop_bytes(&t.top)),
         Err(e) => log!("paste of remote files failed: {e}"),
@@ -221,7 +256,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // Test mode: act as if the user pasted right away.
                     Some(c) if NO_CLIPBOARD.get() => {
                         if let Some(t) = c.files {
-                            t.request();
+                            t.request("test mode");
                         }
                     }
                     Some(c) => write_remote(c),

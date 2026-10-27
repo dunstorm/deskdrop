@@ -34,7 +34,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 c.png.as_ref().map_or(0, |p| p.len())
             );
             if let Some(t) = c.files {
-                t.request();
+                t.request("devpeer");
                 let r = t.wait(Duration::from_secs(120));
                 log!("REMOTE files {:?} -> {:?}", t.top, r);
             }

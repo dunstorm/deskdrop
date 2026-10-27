@@ -38,7 +38,7 @@ define_class!(
         #[unsafe(method(pasteboard:item:provideDataForType:))]
         fn provide(&self, _pb: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
             let iv = self.ivars();
-            iv.transfer.request();
+            iv.transfer.request("a paste");
             // This runs on the main thread, so keep the progress panel (and its Cancel
             // button) alive while we wait.
             let deadline = Instant::now() + PASTE_WAIT;
@@ -173,7 +173,7 @@ pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>, engine:
             if no_clipboard {
                 // Test mode: act as if the user pasted right away.
                 if let Some(t) = &clip.files {
-                    t.request();
+                    t.request("test mode");
                 }
             } else {
                 write_remote(&pb, &clip, &mut keep);

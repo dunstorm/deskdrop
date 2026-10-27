@@ -57,6 +57,8 @@ struct Status {
     ended: Option<Instant>,
 }
 
+type FetchFn = Box<dyn FnOnce(&str) + Send>;
+
 /// A file set moving in either direction. Inbound ones are downloaded into the cache.
 pub struct Transfer {
     pub id: u64,
@@ -70,7 +72,7 @@ pub struct Transfer {
     state: Mutex<Status>,
     cv: Condvar,
     /// Inbound only: asks the peer for the contents. Taken by the first paste.
-    fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fetch: Mutex<Option<FetchFn>>,
 }
 
 impl Transfer {
@@ -97,11 +99,11 @@ impl Transfer {
     }
 
     /// Start downloading, if that hasn't happened yet. Platforms call this when a paste
-    /// asks for the files.
-    pub fn request(&self) {
+    /// asks for the files; `by` names the app that asked, for the logs.
+    pub fn request(&self, by: &str) {
         let f = self.fetch.lock().unwrap().take();
         if let Some(f) = f {
-            f();
+            f(by);
         }
     }
 
@@ -505,9 +507,9 @@ impl Engine {
                 match self.prepare(id, &entries, total) {
                     Ok(ib) => {
                         let me: Weak<Self> = Arc::downgrade(self);
-                        *ib.t.fetch.lock().unwrap() = Some(Box::new(move || {
+                        *ib.t.fetch.lock().unwrap() = Some(Box::new(move |by: &str| {
                             if let Some(me) = me.upgrade() {
-                                me.begin_fetch(id);
+                                me.begin_fetch(id, by);
                             }
                         }));
                         files = Some(ib.t.clone());
@@ -522,7 +524,7 @@ impl Engine {
     }
 
     /// A paste wants the files of clip `id`: ask the peer to send them.
-    fn begin_fetch(&self, id: u64) {
+    fn begin_fetch(&self, id: u64, by: &str) {
         let t = match self.inbound.lock().unwrap().as_ref() {
             Some(ib) if ib.t.id == id => ib.t.clone(),
             _ => return,
@@ -537,8 +539,9 @@ impl Engine {
         }
         t.state.lock().unwrap().started = Some(Instant::now());
         *self.activity.lock().unwrap() = Some(t.clone());
-        log!("receiving {:.1} MB", t.total as f64 / 1e6);
-        self.send(&Msg::Ctl(Ctl::Fetch { id }, vec![]));
+        log!("receiving {:.1} MB, requested by {by}", t.total as f64 / 1e6);
+        let by = Some(by.to_string());
+        self.send(&Msg::Ctl(Ctl::Fetch { id, by }, vec![]));
     }
 
     fn prepare(&self, id: u64, entries: &[Entry], total: u64) -> std::io::Result<Inbound> {
@@ -670,7 +673,10 @@ impl Engine {
                     png,
                     files,
                 } => self.on_clip(id, text, html, png.then_some(blob), files),
-                Ctl::Fetch { id } => self.start_upload(id),
+                Ctl::Fetch { id, by } => {
+                    log!("peer wants the files ({})", by.as_deref().unwrap_or("deskdrop < 0.3.1"));
+                    self.start_upload(id)
+                }
                 Ctl::Cancel { id } => {
                     if let Some(c) = self.sending.lock().unwrap().get(&id) {
                         c.store(true, Ordering::Relaxed);

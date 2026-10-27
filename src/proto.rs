@@ -28,9 +28,11 @@ pub enum Ctl {
         png: bool,
         files: Vec<Entry>,
     },
-    /// Receiver wants the file contents of clip `id`.
+    /// Receiver wants the file contents of clip `id`; `by` names the app that asked.
     Fetch {
         id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     Cancel {
         id: u64,
