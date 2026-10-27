@@ -1,6 +1,7 @@
 //! Small always-on-top progress popup above the taskbar clock. It lives on its own UI thread
-//! so it keeps painting while the clipboard thread is blocked serving a paste. It has a
-//! Cancel button while a transfer runs; clicking anywhere else dismisses it.
+//! so it keeps painting while the clipboard thread is busy. It has a Cancel button while a
+//! transfer runs; clicking anywhere else dismisses it. Only uploads are shown: incoming
+//! files are pasted by Explorer, which shows its own copy dialog.
 
 use crate::engine::{Engine, ProgressView, ViewState};
 use std::cell::{Cell, RefCell};
@@ -251,7 +252,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TIMER => {
             let v = ENGINE.with(|e| e.borrow().as_ref().unwrap().progress());
-            let v = v.filter(|v| v.id != DISMISSED.get());
+            let v = v.filter(|v| v.upload && v.id != DISMISSED.get());
             let visible = IsWindowVisible(hwnd) != 0;
             let show = v.is_some();
             VIEW.with(|x| *x.borrow_mut() = v);

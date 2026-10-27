@@ -179,6 +179,9 @@ pub enum ViewState {
 #[derive(Debug)]
 pub struct ProgressView {
     pub id: u64,
+    /// Sending to the peer (as opposed to receiving).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub upload: bool,
     pub state: ViewState,
     /// e.g. "Receiving 3 items from MacBook"
     pub title: String,
@@ -320,6 +323,7 @@ impl Engine {
         };
         Some(ProgressView {
             id: t.id,
+            upload: t.upload,
             state,
             title,
             detail,
