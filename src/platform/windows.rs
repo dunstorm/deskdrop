@@ -1,8 +1,7 @@
-//! Windows clipboard via a hidden message-only window. Remote files are offered as a
-//! delay-rendered CF_HDROP: Explorer's paste triggers WM_RENDERFORMAT, which starts the
-//! download, waits for it to finish, and then hands over the cached paths.
+//! Windows clipboard via a hidden message-only window. Remote files go on the clipboard
+//! as virtual files (see `win_vfiles`), so nothing downloads until Explorer pastes.
 
-use crate::engine::{Engine, LocalClip, RemoteClip, Transfer};
+use crate::engine::{Engine, LocalClip, RemoteClip};
 use crate::log;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -16,30 +15,19 @@ use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Shell::DragQueryFileW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
-const PASTE_WAIT: Duration = Duration::from_secs(600);
-/// Processes that read every clipboard change without a paste (clipboard history, cloud
-/// clipboard and suggested actions run in svchost). They must not start a download.
-const BACKGROUND_READERS: &[&str] = &["svchost.exe"];
 
 struct Formats {
     html: u32,
     png: u32,
-    drop_effect: u32,
-    history: u32,
-    cloud: u32,
 }
 
 thread_local! {
     static HWND_: Cell<HWND> = const { Cell::new(null_mut()) };
     static FMT: RefCell<Option<Formats>> = const { RefCell::new(None) };
     static IO: RefCell<Option<(Sender<LocalClip>, Receiver<RemoteClip>)>> = const { RefCell::new(None) };
-    static PENDING: RefCell<Option<Arc<Transfer>>> = const { RefCell::new(None) };
     /// Test hook (devpeer builds): leave the real clipboard alone.
     static NO_CLIPBOARD: Cell<bool> = const { Cell::new(false) };
 }
@@ -148,38 +136,22 @@ unsafe fn read_local() -> Option<LocalClip> {
     Some(clip)
 }
 
-fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
-    // DROPFILES { pFiles, pt.x, pt.y, fNC, fWide } followed by NUL-separated UTF-16 paths.
-    let mut v = Vec::new();
-    for x in [20u32, 0, 0, 0, 1] {
-        v.extend_from_slice(&x.to_le_bytes());
-    }
-    for p in paths {
-        v.extend_from_slice(&utf16_bytes(&p.to_string_lossy()));
-    }
-    v.extend_from_slice(&[0, 0]);
-    v
-}
-
 unsafe fn write_remote(clip: RemoteClip) {
+    if let Some(t) = clip.files {
+        super::win_vfiles::set(t, clip.text);
+        return;
+    }
     let hwnd = HWND_.get();
     if !open_clipboard(hwnd) {
         log!("could not open clipboard to write it");
         return;
     }
-    EmptyClipboard(); // sends us WM_DESTROYCLIPBOARD if we owned it, clearing PENDING
+    EmptyClipboard();
     let f = FMT.with(|x| {
         let b = x.borrow();
         let f = b.as_ref().unwrap();
-        (f.html, f.png, f.drop_effect, f.history, f.cloud)
+        (f.html, f.png)
     });
-    if let Some(t) = clip.files {
-        PENDING.with(|p| *p.borrow_mut() = Some(t));
-        SetClipboardData(CF_HDROP as u32, null_mut()); // delayed rendering
-        set_bytes(f.2, &1u32.to_le_bytes()); // DROPEFFECT_COPY
-        set_bytes(f.3, &0u32.to_le_bytes()); // keep cache paths out of Win+V history
-        set_bytes(f.4, &0u32.to_le_bytes());
-    }
     if let Some(t) = &clip.text {
         let crlf = t.replace("\r\n", "\n").replace('\n', "\r\n");
         set_bytes(CF_UNICODETEXT as u32, &utf16_bytes(&crlf));
@@ -196,51 +168,17 @@ unsafe fn write_remote(clip: RemoteClip) {
     CloseClipboard();
 }
 
-/// Executable name of the process that has the clipboard open, i.e. the one asking for data.
-unsafe fn requester() -> String {
-    let w = GetOpenClipboardWindow();
-    if w.is_null() {
-        return "an unknown app".into();
-    }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(w, &mut pid);
-    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if h.is_null() {
-        return format!("pid {pid}");
-    }
-    let mut buf = [0u16; 1024];
-    let mut len = buf.len() as u32;
-    let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
-    CloseHandle(h);
-    if ok == 0 {
-        return format!("pid {pid}");
-    }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    path.rsplit('\\').next().unwrap_or(&path).to_string()
-}
-
-/// Called on WM_RENDERFORMAT (clipboard already opened by the requester).
-unsafe fn render_files() {
-    let Some(t) = PENDING.with(|p| p.borrow().clone()) else {
-        return;
-    };
-    let by = requester();
-    if BACKGROUND_READERS.iter().any(|n| by.eq_ignore_ascii_case(n)) {
-        // Leave the format unrendered; a real paste asks again.
-        log!("not downloading files for {by}: not a paste");
-        return;
-    }
-    t.request(&by);
-    match t.wait(PASTE_WAIT) {
-        Ok(()) => set_bytes(CF_HDROP as u32, &hdrop_bytes(&t.top)),
-        Err(e) => log!("paste of remote files failed: {e}"),
-    }
+/// Whether the clipboard was last set by this process (our window, or OLE's for virtual files).
+unsafe fn owned_by_us() -> bool {
+    let owner = GetClipboardOwner();
+    let mut pid = 0;
+    !owner.is_null() && GetWindowThreadProcessId(owner, &mut pid) != 0 && pid == GetCurrentProcessId()
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLIPBOARDUPDATE => {
-            if GetClipboardOwner() != hwnd && !NO_CLIPBOARD.get() {
+            if !owned_by_us() && !NO_CLIPBOARD.get() {
                 if let Some(clip) = read_local() {
                     IO.with(|io| {
                         let _ = io.borrow().as_ref().unwrap().0.send(clip);
@@ -265,28 +203,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_RENDERFORMAT => {
-            if wp as u32 == CF_HDROP as u32 {
-                render_files();
-            }
-            0
-        }
-        WM_RENDERALLFORMATS => {
-            if open_clipboard(hwnd) {
-                if GetClipboardOwner() == hwnd {
-                    let t = PENDING.with(|p| p.borrow().clone());
-                    if let Some(t) = t.filter(|t| t.is_done()) {
-                        set_bytes(CF_HDROP as u32, &hdrop_bytes(&t.top));
-                    }
-                }
-                CloseClipboard();
-            }
-            0
-        }
-        WM_DESTROYCLIPBOARD => {
-            PENDING.with(|p| *p.borrow_mut() = None);
-            0
-        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -296,14 +212,12 @@ pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>, engine:
         SetProcessDPIAware();
         #[cfg(feature = "devpeer")]
         NO_CLIPBOARD.set(std::env::var_os("DESKDROP_NO_CLIPBOARD").is_some());
-        super::win_progress::spawn(engine);
+        super::win_progress::spawn(engine.clone());
+        super::win_vfiles::init(engine);
         FMT.with(|f| {
             *f.borrow_mut() = Some(Formats {
                 html: reg("HTML Format"),
                 png: reg("PNG"),
-                drop_effect: reg("Preferred DropEffect"),
-                history: reg("CanIncludeInClipboardHistory"),
-                cloud: reg("CanUploadToCloudClipboard"),
             })
         });
         IO.with(|io| *io.borrow_mut() = Some((local_tx, remote_rx)));

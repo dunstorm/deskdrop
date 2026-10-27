@@ -57,10 +57,12 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
 - A small agent (a few MB, no runtime dependencies) runs on each machine. The server listens on TCP
   **24802**, and the client dials it, trying each address in turn and reconnecting on its own.
 - When you copy files, only the file list goes to the other machine. Nothing is downloaded
-  until you **paste**. The other side's clipboard is filled lazily (delay-rendered `CF_HDROP` on
-  Windows, an `NSPasteboardItem` data provider on macOS). The paste starts the download into a
-  cache (`~/Library/Caches/deskdrop` or `%LOCALAPPDATA%\deskdrop\cache`), waits for it, and then
-  copies the files out. A newer copy cancels an unfinished download.
+  until you **paste**. On Windows the files go on the clipboard as *virtual files*
+  (`FileGroupDescriptorW` + `FileContents`, as Remote Desktop does), so Explorer can list them
+  without fetching anything. Pasting streams them in under Explorer's own copy dialog. On macOS
+  an `NSPasteboardItem` data provider does the same for Finder. Data lands in a cache
+  (`~/Library/Caches/deskdrop` or `%LOCALAPPDATA%\deskdrop\cache`) on the way. A newer copy
+  cancels an unfinished download.
 - Folders (including empty ones), Unicode names, and modification times are kept.
   `.DS_Store`, `Thumbs.db`, and `desktop.ini` are skipped.
 - Pastes that take more than a moment show a **progress panel** with speed and time left, on
@@ -113,6 +115,8 @@ Logs are written to `deskdrop.log` in the same folder.
 
 - macOS and Windows only, one pair of machines at a time.
 - Copy and paste only. Dragging across the screen edge isn't supported.
+- On Windows, remote files paste into Explorer, the desktop, and file dialogs. Apps that only
+  accept real file paths (some upload boxes) don't see them; paste into a folder first.
 - Clipboard managers that read every copy (such as Ditto or Maccy) make files download as
   soon as they're copied, because they ask for the data the way a paste does.
 

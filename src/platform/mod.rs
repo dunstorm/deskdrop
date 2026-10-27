@@ -8,6 +8,8 @@ pub use mac::run;
 #[cfg(windows)]
 mod win_progress;
 #[cfg(windows)]
+mod win_vfiles;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use self::windows::run;

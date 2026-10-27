@@ -63,7 +63,13 @@ type FetchFn = Box<dyn FnOnce(&str) + Send>;
 pub struct Transfer {
     pub id: u64,
     /// Absolute paths (in the cache) of the top-level entries, in copy order. Empty for uploads.
+    #[cfg_attr(windows, allow(dead_code))]
     pub top: Vec<PathBuf>,
+    /// Inbound only: the cache dir and every entry (sanitized paths), in arrival order.
+    pub root: PathBuf,
+    pub entries: Vec<Entry>,
+    /// Inbound only: byte offset of each entry within the transfer.
+    offsets: Vec<u64>,
     pub total: u64,
     upload: bool,
     /// "“name”" for a single item, "N items" otherwise.
@@ -84,6 +90,9 @@ impl Transfer {
         Transfer {
             id,
             top,
+            root: PathBuf::new(),
+            entries: Vec::new(),
+            offsets: Vec::new(),
             total,
             upload,
             label,
@@ -123,7 +132,7 @@ impl Transfer {
     }
 
     /// Block until the transfer finishes, fails, or `timeout` elapses.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(feature = "devpeer"), allow(dead_code))]
     pub fn wait(&self, timeout: Duration) -> Result<(), String> {
         self.wait_step(timeout).unwrap_or_else(|| {
             Err(format!(
@@ -132,6 +141,13 @@ impl Transfer {
                 self.total >> 20
             ))
         })
+    }
+
+    /// Bytes of entry `idx` that are already in the cache (entries arrive strictly in order).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn available(&self, idx: usize) -> u64 {
+        let got = self.bytes.load(Ordering::Acquire);
+        got.saturating_sub(self.offsets[idx]).min(self.entries[idx].size)
     }
 
     pub fn is_done(&self) -> bool {
@@ -577,9 +593,16 @@ impl Engine {
             .filter(|e| !e.path.contains('/'))
             .map(|e| e.path.as_str())
             .collect();
-        let t = Arc::new(Transfer::new(id, false, &names, top, total));
+        let mut t = Transfer::new(id, false, &names, top, total);
+        let mut at = 0;
+        for e in &clean {
+            t.offsets.push(at);
+            at += e.size;
+        }
+        t.root = root.clone();
+        t.entries = clean.clone();
         let ib = Inbound {
-            t,
+            t: Arc::new(t),
             root,
             entries: clean,
             cur: None,
@@ -636,7 +659,7 @@ impl Engine {
             self.send(&Msg::Ctl(Ctl::Cancel { id }, vec![]));
             return;
         }
-        ib.t.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        ib.t.bytes.fetch_add(data.len() as u64, Ordering::Release);
     }
 
     fn on_done(&self, id: u64, err: Option<String>) {
