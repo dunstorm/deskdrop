@@ -1,6 +1,6 @@
 //! Windows clipboard via a hidden message-only window. Remote files are offered as a
-//! delay-rendered CF_HDROP: Explorer's paste triggers WM_RENDERFORMAT, which waits for
-//! the download to finish and then hands over the cached paths.
+//! delay-rendered CF_HDROP: Explorer's paste triggers WM_RENDERFORMAT, which starts the
+//! download, waits for it to finish, and then hands over the cached paths.
 
 use crate::engine::{Engine, LocalClip, RemoteClip, Transfer};
 use crate::log;
@@ -195,6 +195,7 @@ unsafe fn render_files() {
     let Some(t) = PENDING.with(|p| p.borrow().clone()) else {
         return;
     };
+    t.request();
     match t.wait(PASTE_WAIT) {
         Ok(()) => set_bytes(CF_HDROP as u32, &hdrop_bytes(&t.top)),
         Err(e) => log!("paste of remote files failed: {e}"),
@@ -217,7 +218,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             loop {
                 let next = IO.with(|io| io.borrow().as_ref().unwrap().1.try_recv().ok());
                 match next {
-                    Some(_) if NO_CLIPBOARD.get() => {}
+                    // Test mode: act as if the user pasted right away.
+                    Some(c) if NO_CLIPBOARD.get() => {
+                        if let Some(t) = c.files {
+                            t.request();
+                        }
+                    }
                     Some(c) => write_remote(c),
                     None => break,
                 }

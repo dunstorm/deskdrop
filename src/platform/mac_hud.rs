@@ -1,30 +1,80 @@
 //! Floating progress panel in the top-right corner (a menu bar item can end up hidden
-//! behind the notch). Click-through, non-activating, visible on every Space.
+//! behind the notch). Non-activating, visible on every Space, with a Cancel button.
 
 use crate::engine::{Engine, ProgressView, ViewState};
 use objc2::rc::Retained;
-use objc2::MainThreadMarker;
+use objc2::runtime::AnyObject;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFont, NSFontWeightRegular, NSFontWeightSemibold, NSLineBreakMode, NSPanel,
+    NSApplication, NSBackingStoreType, NSBezelStyle, NSButton, NSColor, NSControlSize, NSEvent, NSEventMask,
+    NSEventTrackingRunLoopMode, NSFont, NSFontWeightRegular, NSFontWeightSemibold, NSLineBreakMode, NSPanel,
     NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSDate, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CATransaction;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 const W: f64 = 320.0;
 const H: f64 = 74.0;
 const MARGIN: f64 = 12.0;
+const BUTTON_W: f64 = 64.0;
+
+pub struct CancelIvars {
+    engine: Arc<Engine>,
+    id: Cell<u64>,
+}
+
+define_class!(
+    #[unsafe(super(NSButton, objc2_app_kit::NSControl, NSView, objc2_app_kit::NSResponder, objc2::runtime::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "DeskdropCancelButton"]
+    #[ivars = CancelIvars]
+    struct CancelButton;
+
+    impl CancelButton {
+        /// Work on the first click even though the panel never becomes key.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(cancelTransfer:))]
+        fn cancel_transfer(&self, _sender: Option<&AnyObject>) {
+            let iv = self.ivars();
+            iv.engine.cancel(iv.id.get());
+        }
+    }
+);
+
+impl CancelButton {
+    fn new(engine: Arc<Engine>, frame: NSRect, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(CancelIvars {
+            engine,
+            id: Cell::new(0),
+        });
+        let b: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        b.setTitle(&NSString::from_str("Cancel"));
+        b.setBezelStyle(NSBezelStyle::Push);
+        b.setControlSize(NSControlSize::Small);
+        b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        unsafe {
+            b.setTarget(Some(&b));
+            b.setAction(Some(sel!(cancelTransfer:)));
+        }
+        b
+    }
+}
 
 struct Hud {
-    engine: Arc<Engine>,
     panel: Retained<NSPanel>,
     title: Retained<NSTextField>,
     detail: Retained<NSTextField>,
     bar: Retained<NSProgressIndicator>,
+    cancel: Retained<CancelButton>,
+    engine: Arc<Engine>,
     visible: bool,
 }
 
@@ -58,7 +108,7 @@ pub fn init(engine: Arc<Engine>, mtm: MainThreadMarker) {
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
     panel.setHasShadow(true);
-    panel.setIgnoresMouseEvents(true);
+    panel.setBecomesKeyOnlyIfNeeded(true);
     panel.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::Stationary
@@ -84,24 +134,26 @@ pub fn init(engine: Arc<Engine>, mtm: MainThreadMarker) {
     let title = label(mtm, rect(16.0, 44.0, W - 32.0, 18.0), &title_font);
     let detail = label(mtm, rect(16.0, 26.0, W - 32.0, 16.0), &detail_font);
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let cancel = CancelButton::new(engine.clone(), rect(W - 12.0 - BUTTON_W, 40.0, BUTTON_W, 24.0), mtm);
     let bar = NSProgressIndicator::initWithFrame(mtm.alloc(), rect(16.0, 10.0, W - 32.0, 10.0));
     bar.setStyle(NSProgressIndicatorStyle::Bar);
     bar.setIndeterminate(false);
     bar.setMinValue(0.0);
     bar.setMaxValue(1.0);
 
-    let views: [&NSView; 3] = [&title, &detail, &bar];
+    let views: [&NSView; 4] = [&title, &detail, &bar, &cancel];
     for v in views {
         fx.addSubview(v);
     }
     panel.setContentView(Some(&fx));
     HUD.with(|h| {
         *h.borrow_mut() = Some(Hud {
-            engine,
             panel,
             title,
             detail,
             bar,
+            cancel,
+            engine,
             visible: false,
         })
     });
@@ -127,6 +179,29 @@ fn show(h: &Hud, v: &ProgressView) {
     };
     h.detail.setTextColor(Some(&tint));
     h.bar.setHidden(v.state == ViewState::Failed);
+    let running = v.state == ViewState::Running;
+    h.cancel.ivars().id.set(v.id);
+    h.cancel.setHidden(!running);
+    let reserve = if running { BUTTON_W } else { 0.0 };
+    h.title.setFrameSize(NSSize::new(W - 32.0 - reserve, 18.0));
+}
+
+/// Deliver pending clicks to the panel while the main thread is stuck serving a paste.
+pub fn pump_clicks() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let mask = NSEventMask::LeftMouseDown | NSEventMask::LeftMouseUp;
+    // The tracking mode doesn't service pasteboard requests, so this can't re-enter `provide`.
+    while let Some(ev) = unsafe {
+        app.nextEventMatchingMask_untilDate_inMode_dequeue(
+            mask,
+            Some(&NSDate::distantPast()),
+            NSEventTrackingRunLoopMode,
+            true,
+        )
+    } {
+        app.sendEvent(&ev);
+    }
 }
 
 /// Show, update or hide the panel to match the engine. Main thread only; safe to call

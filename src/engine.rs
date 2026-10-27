@@ -1,5 +1,6 @@
 //! Platform-independent core: turns local clipboard changes into offers for the
-//! peer, and remote offers into clipboard contents (prefetching files into a cache).
+//! peer, and remote offers into clipboard contents. File contents only move when
+//! someone pastes; they are downloaded into a cache and handed over from there.
 
 use crate::log;
 use crate::net::{self, Conn, Reader};
@@ -11,7 +12,7 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -48,6 +49,14 @@ enum TState {
     Cancelled,
 }
 
+#[derive(Clone)]
+struct Status {
+    s: TState,
+    /// When bytes started moving; `None` until an inbound transfer is requested.
+    started: Option<Instant>,
+    ended: Option<Instant>,
+}
+
 /// A file set moving in either direction. Inbound ones are downloaded into the cache.
 pub struct Transfer {
     pub id: u64,
@@ -57,10 +66,11 @@ pub struct Transfer {
     upload: bool,
     /// "“name”" for a single item, "N items" otherwise.
     label: String,
-    started: Instant,
     bytes: AtomicU64,
-    state: Mutex<(TState, Option<Instant>)>,
+    state: Mutex<Status>,
     cv: Condvar,
+    /// Inbound only: asks the peer for the contents. Taken by the first paste.
+    fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Transfer {
@@ -75,10 +85,23 @@ impl Transfer {
             total,
             upload,
             label,
-            started: Instant::now(),
             bytes: AtomicU64::new(0),
-            state: Mutex::new((TState::Pending, None)),
+            state: Mutex::new(Status {
+                s: TState::Pending,
+                started: upload.then(Instant::now),
+                ended: None,
+            }),
             cv: Condvar::new(),
+            fetch: Mutex::new(None),
+        }
+    }
+
+    /// Start downloading, if that hasn't happened yet. Platforms call this when a paste
+    /// asks for the files.
+    pub fn request(&self) {
+        let f = self.fetch.lock().unwrap().take();
+        if let Some(f) = f {
+            f();
         }
     }
 
@@ -87,9 +110,9 @@ impl Transfer {
         let g = self.state.lock().unwrap();
         let (g, _) = self
             .cv
-            .wait_timeout_while(g, timeout, |s| matches!(s.0, TState::Pending))
+            .wait_timeout_while(g, timeout, |s| matches!(s.s, TState::Pending))
             .unwrap();
-        match &g.0 {
+        match &g.s {
             TState::Pending => None,
             TState::Done => Some(Ok(())),
             TState::Failed(e) => Some(Err(e.clone())),
@@ -98,7 +121,7 @@ impl Transfer {
     }
 
     /// Block until the transfer finishes, fails, or `timeout` elapses.
-    #[allow(dead_code)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn wait(&self, timeout: Duration) -> Result<(), String> {
         self.wait_step(timeout).unwrap_or_else(|| {
             Err(format!(
@@ -110,13 +133,18 @@ impl Transfer {
     }
 
     pub fn is_done(&self) -> bool {
-        matches!(self.state.lock().unwrap().0, TState::Done)
+        matches!(self.state.lock().unwrap().s, TState::Done)
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self.state.lock().unwrap().s, TState::Pending)
     }
 
     fn finish(&self, s: TState) {
         let mut g = self.state.lock().unwrap();
-        if matches!(g.0, TState::Pending) {
-            *g = (s, Some(Instant::now()));
+        if matches!(g.s, TState::Pending) {
+            g.s = s;
+            g.ended = Some(Instant::now());
         }
         self.cv.notify_all();
     }
@@ -131,7 +159,6 @@ pub enum ViewState {
 
 /// What the platform's progress UI should show right now.
 #[derive(Debug)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub struct ProgressView {
     pub id: u64,
     pub state: ViewState,
@@ -226,11 +253,12 @@ impl Engine {
     /// Progress of the latest file transfer, or `None` when nothing should be shown.
     pub fn progress(&self) -> Option<ProgressView> {
         let t = self.activity.lock().unwrap().clone()?;
-        let (state, ended) = t.state.lock().unwrap().clone();
+        let st = t.state.lock().unwrap().clone();
+        let started = st.started?;
         let now = Instant::now();
-        let end = ended.unwrap_or(now);
-        let elapsed = end - t.started;
-        let state = match state {
+        let end = st.ended.unwrap_or(now);
+        let elapsed = end - started;
+        let state = match &st.s {
             TState::Pending if elapsed < SHOW_AFTER => return None,
             TState::Pending => ViewState::Running,
             TState::Done if elapsed < SHOW_AFTER || now - end > SHOW_DONE_FOR => return None,
@@ -239,8 +267,8 @@ impl Engine {
             TState::Failed(_) => ViewState::Failed,
             TState::Cancelled => return None,
         };
-        let failure = match &t.state.lock().unwrap().0 {
-            TState::Failed(e) => e.clone(),
+        let failure = match st.s {
+            TState::Failed(e) => e,
             _ => String::new(),
         };
         let bytes = t.bytes.load(Ordering::Relaxed).min(t.total);
@@ -279,6 +307,22 @@ impl Engine {
             detail,
             fraction,
         })
+    }
+
+    /// Stop transfer `id` (from the progress panel's Cancel button).
+    pub fn cancel(&self, id: u64) {
+        let inbound = self.inbound.lock().unwrap().as_ref().is_some_and(|ib| ib.t.id == id);
+        if inbound {
+            self.cancel_inbound("cancelled");
+            return;
+        }
+        let flag = self.sending.lock().unwrap().get(&id).cloned();
+        if let Some(flag) = flag {
+            flag.store(true, Ordering::Relaxed);
+            log!("upload {id} cancelled here");
+            let msg = format!("Cancelled on {}", self.name);
+            self.send(&Msg::Ctl(Ctl::Fail { id, msg }, vec![]));
+        }
     }
 
     // ---------- local -> remote ----------
@@ -439,7 +483,14 @@ impl Engine {
         }
     }
 
-    fn on_clip(&self, id: u64, text: Option<String>, html: Option<String>, png: Option<Vec<u8>>, entries: Vec<Entry>) {
+    fn on_clip(
+        self: &Arc<Self>,
+        id: u64,
+        text: Option<String>,
+        html: Option<String>,
+        png: Option<Vec<u8>>,
+        entries: Vec<Entry>,
+    ) {
         self.cancel_inbound("superseded by a newer remote copy");
         let mut files = None;
         let total: u64 = entries.iter().map(|e| e.size).sum();
@@ -453,17 +504,41 @@ impl Engine {
             } else {
                 match self.prepare(id, &entries, total) {
                     Ok(ib) => {
+                        let me: Weak<Self> = Arc::downgrade(self);
+                        *ib.t.fetch.lock().unwrap() = Some(Box::new(move || {
+                            if let Some(me) = me.upgrade() {
+                                me.begin_fetch(id);
+                            }
+                        }));
                         files = Some(ib.t.clone());
-                        *self.activity.lock().unwrap() = Some(ib.t.clone());
                         *self.inbound.lock().unwrap() = Some(ib);
-                        self.send(&Msg::Ctl(Ctl::Fetch { id }, vec![]));
-                        log!("receiving {} entries, {:.1} MB", entries.len(), total as f64 / 1e6);
+                        log!("offered {} entries, {:.1} MB", entries.len(), total as f64 / 1e6);
                     }
                     Err(e) => log!("cannot prepare cache: {e}"),
                 }
             }
         }
         let _ = self.to_platform.send(RemoteClip { text, html, png, files });
+    }
+
+    /// A paste wants the files of clip `id`: ask the peer to send them.
+    fn begin_fetch(&self, id: u64) {
+        let t = match self.inbound.lock().unwrap().as_ref() {
+            Some(ib) if ib.t.id == id => ib.t.clone(),
+            _ => return,
+        };
+        if !t.is_pending() {
+            return;
+        }
+        if !self.connected() {
+            let peer = self.peer_name.lock().unwrap().clone();
+            t.finish(TState::Failed(format!("Not connected to {peer}")));
+            return;
+        }
+        t.state.lock().unwrap().started = Some(Instant::now());
+        *self.activity.lock().unwrap() = Some(t.clone());
+        log!("receiving {:.1} MB", t.total as f64 / 1e6);
+        self.send(&Msg::Ctl(Ctl::Fetch { id }, vec![]));
     }
 
     fn prepare(&self, id: u64, entries: &[Entry], total: u64) -> std::io::Result<Inbound> {
@@ -798,9 +873,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("deskdrop-test-{}", std::process::id()));
         let eng = Engine::new("me".into(), dir.clone(), u64::MAX, tx);
         *eng.peer_name.lock().unwrap() = "PC".into();
-        let mut t = Transfer::new(7, false, &["a", "b"], vec![], 300_000_000);
-        t.started = Instant::now() - Duration::from_secs(2);
-        let t = Arc::new(t);
+        let t = Arc::new(Transfer::new(7, false, &["a", "b"], vec![], 300_000_000));
+        *eng.activity.lock().unwrap() = Some(t.clone());
+        // Not requested by a paste yet: nothing to show.
+        assert!(eng.progress().is_none());
+        t.state.lock().unwrap().started = Some(Instant::now() - Duration::from_secs(2));
         t.bytes.store(100_000_000, Ordering::Relaxed);
         *eng.activity.lock().unwrap() = Some(t.clone());
         let v = eng.progress().unwrap();

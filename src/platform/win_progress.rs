@@ -1,5 +1,6 @@
 //! Small always-on-top progress popup above the taskbar clock. It lives on its own UI thread
-//! so it keeps painting while the clipboard thread is blocked serving a paste. Click to dismiss.
+//! so it keeps painting while the clipboard thread is blocked serving a paste. It has a
+//! Cancel button while a transfer runs; clicking anywhere else dismisses it.
 
 use crate::engine::{Engine, ProgressView, ViewState};
 use std::cell::{Cell, RefCell};
@@ -128,13 +129,24 @@ unsafe fn place(hwnd: HWND) {
     );
 }
 
+/// Where the Cancel button sits, on the title row.
+fn cancel_rect(rc: &RECT) -> RECT {
+    let right = rc.right - s(12);
+    RECT {
+        left: right - s(64),
+        top: s(10),
+        right,
+        bottom: s(34),
+    }
+}
+
 unsafe fn fill(dc: HDC, r: &RECT, color: COLORREF) {
     let b = CreateSolidBrush(color);
     FillRect(dc, r, b);
     DeleteObject(b);
 }
 
-unsafe fn text(dc: HDC, s: &str, mut r: RECT, f: HFONT, color: COLORREF) {
+unsafe fn text(dc: HDC, s: &str, mut r: RECT, f: HFONT, color: COLORREF, align: u32) {
     SelectObject(dc, f);
     SetTextColor(dc, color);
     let w = wide(s);
@@ -143,7 +155,7 @@ unsafe fn text(dc: HDC, s: &str, mut r: RECT, f: HFONT, color: COLORREF) {
         w.as_ptr(),
         -1,
         &mut r,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
 }
 
@@ -167,17 +179,27 @@ unsafe fn paint(hwnd: HWND) {
             let f = f.borrow();
             let f = f.as_ref().unwrap();
             let (l, r) = (s(16), rc.right - s(16));
+            let running = v.state == ViewState::Running;
+            let cancel = cancel_rect(&rc);
+            if running {
+                fill(mem, &cancel, rgb(55, 55, 55));
+                let edge = CreateSolidBrush(rgb(85, 85, 85));
+                FrameRect(mem, &cancel, edge);
+                DeleteObject(edge);
+                text(mem, "Cancel", cancel, f.body, rgb(255, 255, 255), DT_CENTER);
+            }
             text(
                 mem,
                 &v.title,
                 RECT {
                     left: l,
                     top: s(12),
-                    right: r,
+                    right: if running { cancel.left - s(8) } else { r },
                     bottom: s(32),
                 },
                 f.title,
                 rgb(255, 255, 255),
+                DT_LEFT,
             );
             let detail_color = match v.state {
                 ViewState::Running => rgb(190, 190, 190),
@@ -195,6 +217,7 @@ unsafe fn paint(hwnd: HWND) {
                 },
                 f.body,
                 detail_color,
+                DT_LEFT,
             );
             if v.state != ViewState::Failed {
                 let track = RECT {
@@ -244,10 +267,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONUP => {
-            if let Some(id) = VIEW.with(|v| v.borrow().as_ref().map(|v| v.id)) {
+            let pt = POINT {
+                x: (lp & 0xffff) as i16 as i32,
+                y: ((lp >> 16) & 0xffff) as i16 as i32,
+            };
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let Some((id, state)) = VIEW.with(|v| v.borrow().as_ref().map(|v| (v.id, v.state))) else {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            };
+            if state == ViewState::Running && PtInRect(&cancel_rect(&rc), pt) != 0 {
+                // The engine drops the transfer and the next tick hides the popup.
+                ENGINE.with(|e| e.borrow().as_ref().unwrap().cancel(id));
+            } else {
                 DISMISSED.set(id);
+                ShowWindow(hwnd, SW_HIDE);
             }
-            ShowWindow(hwnd, SW_HIDE);
             0
         }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,

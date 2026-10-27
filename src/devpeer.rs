@@ -1,5 +1,6 @@
 //! Debug-only headless peer for testing one real agent without a second OS.
-//! `deskdrop devpeer HOST:PORT SECRET`, then stdin lines: `text <s>` or `files <path>...`.
+//! `deskdrop devpeer HOST:PORT SECRET`, then stdin lines: `text <s>`, `files <path>...`, or
+//! `cancel` (stops the transfer in progress). Remote files are "pasted" right away.
 
 use crate::engine::{Engine, LocalClip};
 use crate::{log, net};
@@ -22,8 +23,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     thread::spawn(move || e.pump_local(local_rx));
     let e = eng.clone();
     thread::spawn(move || e.keepalive());
-    let a = addr.clone();
-    thread::spawn(move || eng.connect(vec![a], psk));
+    let (a, e) = (addr.clone(), eng.clone());
+    thread::spawn(move || e.connect(vec![a], psk));
     thread::spawn(move || {
         for c in remote_rx {
             log!(
@@ -33,6 +34,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 c.png.as_ref().map_or(0, |p| p.len())
             );
             if let Some(t) = c.files {
+                t.request();
                 let r = t.wait(Duration::from_secs(120));
                 log!("REMOTE files {:?} -> {:?}", t.top, r);
             }
@@ -49,6 +51,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 files: rest.split_whitespace().map(PathBuf::from).collect(),
                 ..Default::default()
             },
+            "cancel" => {
+                match eng.progress() {
+                    Some(v) => eng.cancel(v.id),
+                    None => log!("nothing to cancel"),
+                }
+                continue;
+            }
             _ => continue,
         };
         let _ = local_tx.send(clip);

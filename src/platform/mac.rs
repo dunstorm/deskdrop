@@ -1,5 +1,6 @@
 //! macOS clipboard via NSPasteboard. Polls changeCount (there is no change notification)
-//! and serves remote files lazily: Finder's paste blocks until the download is done.
+//! and serves remote files lazily: Finder's paste starts the download and blocks until
+//! it's done.
 //! Transfer progress is shown in a floating panel (see `mac_hud`).
 
 use crate::engine::{Engine, LocalClip, RemoteClip, Transfer};
@@ -37,13 +38,18 @@ define_class!(
         #[unsafe(method(pasteboard:item:provideDataForType:))]
         fn provide(&self, _pb: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
             let iv = self.ivars();
-            // This runs on the main thread, so keep the menu bar progress fresh while we wait.
+            iv.transfer.request();
+            // This runs on the main thread, so keep the progress panel (and its Cancel
+            // button) alive while we wait.
             let deadline = Instant::now() + PASTE_WAIT;
             let r = loop {
-                match iv.transfer.wait_step(Duration::from_millis(150)) {
+                match iv.transfer.wait_step(Duration::from_millis(100)) {
                     Some(r) => break r,
                     None if Instant::now() > deadline => break Err("timed out".into()),
-                    None => super::mac_hud::update(),
+                    None => {
+                        super::mac_hud::pump_clicks();
+                        super::mac_hud::update();
+                    }
                 }
             };
             super::mac_hud::update();
@@ -164,7 +170,12 @@ pub fn run(local_tx: Sender<LocalClip>, remote_rx: Receiver<RemoteClip>, engine:
         }
         super::mac_hud::update();
         while let Ok(clip) = remote_rx.try_recv() {
-            if !no_clipboard {
+            if no_clipboard {
+                // Test mode: act as if the user pasted right away.
+                if let Some(t) = &clip.files {
+                    t.request();
+                }
+            } else {
                 write_remote(&pb, &clip, &mut keep);
                 last = pb.changeCount();
             }

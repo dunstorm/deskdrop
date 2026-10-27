@@ -56,17 +56,17 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
 
 - A small agent (a few MB, no runtime dependencies) runs on each machine. The server listens on TCP
   **24802**, and the client dials it, trying each address in turn and reconnecting on its own.
-- When you copy files, the file list goes to the other machine right away, and that machine
-  starts downloading the contents into a cache (`~/Library/Caches/deskdrop` or
-  `%LOCALAPPDATA%\deskdrop\cache`). A newer copy cancels the old download.
-- The other side's clipboard is filled **lazily**: delay-rendered `CF_HDROP` on Windows and an
-  `NSPasteboardItem` data provider on macOS. If you paste before the download is done, the paste
-  waits for it and then copies the files out of the cache.
+- When you copy files, only the file list goes to the other machine. Nothing is downloaded
+  until you **paste**. The other side's clipboard is filled lazily (delay-rendered `CF_HDROP` on
+  Windows, an `NSPasteboardItem` data provider on macOS). The paste starts the download into a
+  cache (`~/Library/Caches/deskdrop` or `%LOCALAPPDATA%\deskdrop\cache`), waits for it, and then
+  copies the files out. A newer copy cancels an unfinished download.
 - Folders (including empty ones), Unicode names, and modification times are kept.
   `.DS_Store`, `Thumbs.db`, and `desktop.ini` are skipped.
-- Copies that take more than a moment show a **progress panel** with speed and time left, on
-  both machines. On the Mac it floats in the top-right corner; on Windows it sits above the
-  taskbar clock (click it to dismiss). It shows "Received" when the copy is done, then hides itself.
+- Pastes that take more than a moment show a **progress panel** with speed and time left, on
+  both machines, with a **Cancel** button that works from either side. On the Mac it floats in
+  the top-right corner; on Windows it sits above the taskbar clock. It shows "Received" when the
+  copy is done, then hides itself.
 - Text is converted between `\n` and `\r\n`. Images travel as PNG, with `CF_DIB` added on
   Windows for older apps. Rich text travels as HTML.
 
@@ -104,7 +104,7 @@ Logs are written to `deskdrop.log` in the same folder.
 - **The client can't reach the server.** With the macOS firewall on, allow incoming connections
   for `deskdrop`. With Windows as the server, allow TCP 24802 in Windows Defender Firewall.
 - **Big copies paste slowly.** The paste waits for the download to finish. Transfers run at LAN
-  speed; watch the progress panel to see how long is left.
+  speed; the progress panel shows how long is left, and **Cancel** stops it.
 - **"Windows protected your PC" or a Gatekeeper warning.** Release binaries aren't code-signed
   yet. Downloading with `iwr` or `curl` as shown above avoids the warning. Otherwise choose
   *More info → Run anyway*, or run `xattr -d com.apple.quarantine deskdrop`.
@@ -113,7 +113,8 @@ Logs are written to `deskdrop.log` in the same folder.
 
 - macOS and Windows only, one pair of machines at a time.
 - Copy and paste only. Dragging across the screen edge isn't supported.
-- File copies are prefetched in full when you copy, not when you paste.
+- Clipboard managers that read every copy (such as Ditto or Maccy) make files download as
+  soon as they're copied, because they ask for the data the way a paste does.
 
 ## Building from source
 
