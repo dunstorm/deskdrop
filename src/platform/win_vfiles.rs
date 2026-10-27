@@ -2,7 +2,7 @@
 //! FileContents), the way Remote Desktop does it. Explorer reads the file list whenever it
 //! likes (it does so as soon as the clipboard changes) but asks for contents only when it
 //! pastes. That first request starts the download, and each file streams out of the cache
-//! as its bytes arrive, under Explorer's own copy dialog.
+//! as its bytes arrive.
 
 use crate::engine::{Engine, Transfer};
 use crate::log;
@@ -125,7 +125,8 @@ impl Files {
 
     /// FILEGROUPDESCRIPTORW: a count followed by one FILEDESCRIPTORW per entry.
     fn descriptor(&self) -> Vec<u8> {
-        let flags = [FD_ATTRIBUTES, FD_FILESIZE, FD_WRITESTIME, FD_PROGRESSUI, FD_UNICODE]
+        // No FD_PROGRESSUI: our own popup shows progress (with Cancel), not Explorer's dialog.
+        let flags = [FD_ATTRIBUTES, FD_FILESIZE, FD_WRITESTIME, FD_UNICODE]
             .iter()
             .fold(0u32, |acc, f| acc | f.0 as u32);
         let mut out = (self.t.entries.len() as u32).to_le_bytes().to_vec();

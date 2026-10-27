@@ -59,7 +59,7 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
 - When you copy files, only the file list goes to the other machine. Nothing is downloaded
   until you **paste**. On Windows the files go on the clipboard as *virtual files*
   (`FileGroupDescriptorW` + `FileContents`, as Remote Desktop does), so Explorer can list them
-  without fetching anything. Pasting streams them in under Explorer's own copy dialog. On macOS
+  without fetching anything; pasting streams them in. On macOS
   an `NSPasteboardItem` data provider does the same for Finder. Data lands in a cache
   (`~/Library/Caches/deskdrop` or `%LOCALAPPDATA%\deskdrop\cache`) on the way. A newer copy
   cancels an unfinished download.
