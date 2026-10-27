@@ -65,10 +65,10 @@ deskdrop uninstall        # or deskdrop.exe uninstall on Windows
   cancels an unfinished download.
 - Folders (including empty ones), Unicode names, and modification times are kept.
   `.DS_Store`, `Thumbs.db`, and `desktop.ini` are skipped.
-- Pastes that take more than a moment show a **progress panel** with speed and time left and a
-  **Cancel** button. On the Mac it floats in the top-right corner, in both directions. On Windows
-  it sits above the taskbar clock while sending; when receiving, Explorer's own copy dialog
-  does that job, and its Cancel stops the transfer too.
+- Pastes that take more than a moment show a **progress panel** with speed and time left, on
+  both machines, with a **Cancel** button that works from either side. On the Mac it floats in
+  the top-right corner; on Windows it sits above the taskbar clock. It shows "Received" when the
+  copy is done, then hides itself.
 - Text is converted between `\n` and `\r\n`. Images travel as PNG, with `CF_DIB` added on
   Windows for older apps. Rich text travels as HTML.
 
